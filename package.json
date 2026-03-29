@@ -1,0 +1,7 @@
+{
+  "name": "trek-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "TREK travel planner MCP server — vanilla JSON-RPC, no npm deps",
+  "main": "index.js"
+}

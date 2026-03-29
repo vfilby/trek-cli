@@ -1,0 +1,633 @@
+#!/usr/bin/env node
+/**
+ * trek — CLI for the TREK self-hosted travel planner.
+ * No npm dependencies — uses curl for HTTP (avoids macOS Local Network Privacy blocks on Node).
+ *
+ * Usage: trek <command> [options]
+ * Config: TREK_URL, TREK_EMAIL, TREK_PASSWORD env vars (or .env file)
+ */
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+// Load .env from script directory if present
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  for (const line of fs.readFileSync(envPath, 'utf-8').split('\n')) {
+    const m = line.match(/^\s*([^#=]+?)\s*=\s*(.*?)\s*$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  }
+}
+
+const TREK_URL = (process.env.TREK_URL || '').replace(/\/+$/, '');
+const TREK_EMAIL = process.env.TREK_EMAIL || '';
+const TREK_PASSWORD = process.env.TREK_PASSWORD || '';
+
+let token = null;
+const TOKEN_PATH = path.join(__dirname, '.token');
+
+function loadToken() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf-8'));
+    if (data.url === TREK_URL && data.email === TREK_EMAIL && data.expires > Date.now()) {
+      token = data.token;
+    }
+  } catch {}
+}
+
+function saveToken() {
+  // Cache token for 23 hours (JWT is typically 24h)
+  fs.writeFileSync(TOKEN_PATH, JSON.stringify({
+    token, url: TREK_URL, email: TREK_EMAIL,
+    expires: Date.now() + 23 * 60 * 60 * 1000,
+  }));
+}
+
+loadToken();
+
+// ── API Client (curl-based) ─────────────────────────────────
+
+function curlRequest(method, url, headers, body) {
+  const args = ['curl', '-s', '-w', '\\n%{http_code}', '-X', method];
+  for (const [k, v] of Object.entries(headers)) {
+    args.push('-H', `${k}: ${v}`);
+  }
+  if (body) {
+    args.push('-d', JSON.stringify(body));
+  }
+  const cmd = args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+  const raw = execSync(cmd + ` '${url}'`, { encoding: 'utf-8', timeout: 30000 });
+  const lines = raw.trimEnd().split('\n');
+  const status = parseInt(lines.pop(), 10);
+  const responseBody = lines.join('\n');
+  return { status, body: responseBody };
+}
+
+function login() {
+  if (!TREK_URL || !TREK_EMAIL || !TREK_PASSWORD) {
+    die('Missing TREK_URL, TREK_EMAIL, or TREK_PASSWORD. Set env vars or create .env file.');
+  }
+  const { status, body } = curlRequest('POST', `${TREK_URL}/api/auth/login`,
+    { 'Content-Type': 'application/json' },
+    { email: TREK_EMAIL, password: TREK_PASSWORD });
+  if (status !== 200) die(`Login failed (${status}): ${body}`);
+  const data = JSON.parse(body);
+  token = data.token;
+  saveToken();
+}
+
+function api(method, apiPath, body, retry = true) {
+  if (!token) login();
+  const url = `${TREK_URL}${apiPath}`;
+  const headers = { Authorization: `Bearer ${token}` };
+  if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+    headers['Content-Type'] = 'application/json';
+  }
+  const res = curlRequest(method, url, headers, body);
+  if (res.status === 401 && retry) {
+    token = null;
+    login();
+    return api(method, apiPath, body, false);
+  }
+  if (res.status < 200 || res.status >= 300) {
+    die(`API ${method} ${apiPath} → ${res.status}: ${res.body}`);
+  }
+  return res.body ? JSON.parse(res.body) : {};
+}
+
+function get(p) { return api('GET', p); }
+function post(p, b) { return api('POST', p, b); }
+function put(p, b) { return api('PUT', p, b); }
+function del(p) { return api('DELETE', p); }
+
+// ── Helpers ─────────────────────────────────────────────────
+
+function die(msg) {
+  console.error(`trek: ${msg}`);
+  process.exit(1);
+}
+
+function out(data) {
+  console.log(JSON.stringify(data, null, 2));
+}
+
+function need(args, ...keys) {
+  for (const k of keys) {
+    if (args[k] === undefined) die(`Missing required option: --${k}`);
+  }
+}
+
+function parseArgs(argv) {
+  const positional = [];
+  const named = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      if (eq > -1) {
+        named[a.slice(2, eq)] = coerce(a.slice(eq + 1));
+      } else {
+        const next = argv[i + 1];
+        if (next !== undefined && !next.startsWith('--')) {
+          named[a.slice(2)] = coerce(next);
+          i++;
+        } else {
+          named[a.slice(2)] = true;
+        }
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, named };
+}
+
+function coerce(v) {
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  if (v === 'null') return null;
+  if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
+  return v;
+}
+
+// ── Commands ────────────────────────────────────────────────
+
+const commands = {};
+
+// Trips
+
+commands.trips = {
+  desc: 'List all trips',
+  usage: '[--archived]',
+  args: { archived: { type: 'boolean', desc: 'Show archived trips instead of active' } },
+  required: [],
+  async run(args) {
+    const q = args.archived ? '?archived=1' : '';
+    const { trips } = await get(`/api/trips${q}`);
+    out(trips.map(t => ({
+      id: t.id, title: t.title, start: t.start_date, end: t.end_date,
+      days: t.day_count, places: t.place_count, currency: t.currency,
+    })));
+  },
+};
+
+commands['trip:create'] = {
+  desc: 'Create a new trip. Auto-generates day records from date range (max 90 days).',
+  usage: '--title <name> [--description <text>] [--start_date YYYY-MM-DD] [--end_date YYYY-MM-DD] [--currency USD]',
+  args: { title: { type: 'string', desc: 'Trip title' }, description: { type: 'string', desc: 'Trip description' }, start_date: { type: 'string', desc: 'Start date (YYYY-MM-DD)' }, end_date: { type: 'string', desc: 'End date (YYYY-MM-DD)' }, currency: { type: 'string', desc: 'Currency code (e.g. USD, EUR). Default: EUR' } },
+  required: ['title'],
+  async run(args) {
+    need(args, 'title');
+    out(await post('/api/trips', args));
+  },
+};
+
+commands['trip:get'] = {
+  desc: 'Get trip details including day/place/member counts',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await get(`/api/trips/${args.trip_id}`));
+  },
+};
+
+commands['trip:update'] = {
+  desc: 'Update trip properties',
+  usage: '--trip_id <id> [--title] [--description] [--start_date] [--end_date] [--currency] [--is_archived]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, title: { type: 'string', desc: 'New title' }, description: { type: 'string', desc: 'New description' }, start_date: { type: 'string', desc: 'New start date (YYYY-MM-DD)' }, end_date: { type: 'string', desc: 'New end date (YYYY-MM-DD)' }, currency: { type: 'string', desc: 'New currency code' }, is_archived: { type: 'boolean', desc: 'Archive or unarchive' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    const { trip_id, ...fields } = args;
+    out(await put(`/api/trips/${trip_id}`, fields));
+  },
+};
+
+commands['trip:delete'] = {
+  desc: 'Delete a trip (owner only)',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await del(`/api/trips/${args.trip_id}`));
+  },
+};
+
+// Days
+
+commands.days = {
+  desc: 'List days for a trip with assignments and notes',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await get(`/api/trips/${args.trip_id}/days`));
+  },
+};
+
+commands['day:add'] = {
+  desc: 'Add a day to a trip',
+  usage: '--trip_id <id> [--date YYYY-MM-DD] [--notes <text>]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, date: { type: 'string', desc: 'Date (YYYY-MM-DD)' }, notes: { type: 'string', desc: 'Day notes' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    const { trip_id, ...body } = args;
+    out(await post(`/api/trips/${trip_id}/days`, body));
+  },
+};
+
+commands['day:update'] = {
+  desc: 'Update a day title or notes',
+  usage: '--trip_id <id> --day_id <id> [--title] [--notes]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, day_id: { type: 'number', desc: 'Day ID' }, title: { type: 'string', desc: 'Day title (e.g. "Arrival Day")' }, notes: { type: 'string', desc: 'Day notes' } },
+  required: ['trip_id', 'day_id'],
+  async run(args) {
+    need(args, 'trip_id', 'day_id');
+    const { trip_id, day_id, ...body } = args;
+    out(await put(`/api/trips/${trip_id}/days/${day_id}`, body));
+  },
+};
+
+// Places
+
+commands.places = {
+  desc: 'List places for a trip. Supports search, category, and tag filters.',
+  usage: '--trip_id <id> [--search <query>] [--category <cat>] [--tag <tag>]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, search: { type: 'string', desc: 'Search by name' }, category: { type: 'string', desc: 'Filter by category' }, tag: { type: 'string', desc: 'Filter by tag' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    const params = new URLSearchParams();
+    if (args.search) params.set('search', args.search);
+    if (args.category) params.set('category', args.category);
+    if (args.tag) params.set('tag', args.tag);
+    const q = params.toString() ? `?${params}` : '';
+    out(await get(`/api/trips/${args.trip_id}/places${q}`));
+  },
+};
+
+commands['place:add'] = {
+  desc: 'Add a place to a trip. Use search first to get coordinates.',
+  usage: '--trip_id <id> --name <name> [--lat] [--lng] [--address] [--category_id] [--price] [--currency] [--duration_minutes] [--notes] [--website] [--phone] [--transport_mode]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, name: { type: 'string', desc: 'Place name (max 200 chars)' }, description: { type: 'string', desc: 'Description (max 2000 chars)' }, lat: { type: 'number', desc: 'Latitude' }, lng: { type: 'number', desc: 'Longitude' }, address: { type: 'string', desc: 'Street address' }, category_id: { type: 'number', desc: 'Category ID' }, price: { type: 'number', desc: 'Estimated price' }, currency: { type: 'string', desc: 'Price currency code' }, duration_minutes: { type: 'number', desc: 'Expected visit duration in minutes' }, notes: { type: 'string', desc: 'Notes (max 2000 chars)' }, website: { type: 'string', desc: 'Website URL' }, phone: { type: 'string', desc: 'Phone number' }, transport_mode: { type: 'string', desc: 'How to reach: walking, driving, transit, bicycling' } },
+  required: ['trip_id', 'name'],
+  async run(args) {
+    need(args, 'trip_id', 'name');
+    const { trip_id, ...body } = args;
+    out(await post(`/api/trips/${trip_id}/places`, body));
+  },
+};
+
+commands['place:update'] = {
+  desc: 'Update a place',
+  usage: '--trip_id <id> --place_id <id> [--name] [--lat] [--lng] [--address] ...',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, place_id: { type: 'number', desc: 'Place ID' }, name: { type: 'string', desc: 'Place name' }, lat: { type: 'number', desc: 'Latitude' }, lng: { type: 'number', desc: 'Longitude' }, address: { type: 'string', desc: 'Address' }, category_id: { type: 'number', desc: 'Category ID' }, price: { type: 'number', desc: 'Price' }, currency: { type: 'string', desc: 'Currency' }, duration_minutes: { type: 'number', desc: 'Duration in minutes' }, notes: { type: 'string', desc: 'Notes' }, website: { type: 'string', desc: 'Website' }, phone: { type: 'string', desc: 'Phone' }, transport_mode: { type: 'string', desc: 'Transport mode' } },
+  required: ['trip_id', 'place_id'],
+  async run(args) {
+    need(args, 'trip_id', 'place_id');
+    const { trip_id, place_id, ...body } = args;
+    out(await put(`/api/trips/${trip_id}/places/${place_id}`, body));
+  },
+};
+
+commands['place:delete'] = {
+  desc: 'Delete a place from a trip',
+  usage: '--trip_id <id> --place_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, place_id: { type: 'number', desc: 'Place ID' } },
+  required: ['trip_id', 'place_id'],
+  async run(args) {
+    need(args, 'trip_id', 'place_id');
+    out(await del(`/api/trips/${args.trip_id}/places/${args.place_id}`));
+  },
+};
+
+// Assignments
+
+commands['day:assign'] = {
+  desc: 'Assign a place to a day. The place must already exist in the trip.',
+  usage: '--trip_id <id> --day_id <id> --place_id <id> [--notes]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, day_id: { type: 'number', desc: 'Day ID' }, place_id: { type: 'number', desc: 'Place ID' }, notes: { type: 'string', desc: 'Assignment notes' } },
+  required: ['trip_id', 'day_id', 'place_id'],
+  async run(args) {
+    need(args, 'trip_id', 'day_id', 'place_id');
+    const body = { place_id: args.place_id };
+    if (args.notes) body.notes = args.notes;
+    out(await post(`/api/trips/${args.trip_id}/days/${args.day_id}/assignments`, body));
+  },
+};
+
+commands['day:unassign'] = {
+  desc: 'Remove a place assignment from a day',
+  usage: '--trip_id <id> --day_id <id> --assignment_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, day_id: { type: 'number', desc: 'Day ID' }, assignment_id: { type: 'number', desc: 'Assignment ID' } },
+  required: ['trip_id', 'day_id', 'assignment_id'],
+  async run(args) {
+    need(args, 'trip_id', 'day_id', 'assignment_id');
+    out(await del(`/api/trips/${args.trip_id}/days/${args.day_id}/assignments/${args.assignment_id}`));
+  },
+};
+
+commands['day:reorder'] = {
+  desc: 'Reorder assignments within a day',
+  usage: '--trip_id <id> --day_id <id> --ids 1,2,3',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, day_id: { type: 'number', desc: 'Day ID' }, ids: { type: 'string', desc: 'Comma-separated assignment IDs in desired order' } },
+  required: ['trip_id', 'day_id', 'ids'],
+  async run(args) {
+    need(args, 'trip_id', 'day_id', 'ids');
+    const orderedIds = String(args.ids).split(',').map(Number);
+    out(await put(`/api/trips/${args.trip_id}/days/${args.day_id}/assignments/reorder`, { orderedIds }));
+  },
+};
+
+commands['assignment:time'] = {
+  desc: 'Set start/end time for an assignment. Pass null to clear.',
+  usage: '--trip_id <id> --assignment_id <id> [--place_time 09:00] [--end_time 11:00]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, assignment_id: { type: 'number', desc: 'Assignment ID' }, place_time: { type: 'string', desc: 'Start time (e.g. "09:00")' }, end_time: { type: 'string', desc: 'End time (e.g. "11:00")' } },
+  required: ['trip_id', 'assignment_id'],
+  async run(args) {
+    need(args, 'trip_id', 'assignment_id');
+    const body = {};
+    if (args.place_time !== undefined) body.place_time = args.place_time;
+    if (args.end_time !== undefined) body.end_time = args.end_time;
+    out(await put(`/api/trips/${args.trip_id}/assignments/${args.assignment_id}/time`, body));
+  },
+};
+
+// Budget
+
+commands.budget = {
+  desc: 'List budget items for a trip with per-member payment status',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await get(`/api/trips/${args.trip_id}/budget`));
+  },
+};
+
+commands['budget:add'] = {
+  desc: 'Add a budget/expense item',
+  usage: '--trip_id <id> --name <name> [--category] [--total_price] [--persons] [--days] [--note]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, name: { type: 'string', desc: 'Expense name' }, category: { type: 'string', desc: 'Category (Accommodation, Transport, Food, Activities, Other)' }, total_price: { type: 'number', desc: 'Total price' }, persons: { type: 'number', desc: 'Number of persons to split between' }, days: { type: 'number', desc: 'Number of days (for per-day expenses)' }, note: { type: 'string', desc: 'Notes' } },
+  required: ['trip_id', 'name'],
+  async run(args) {
+    need(args, 'trip_id', 'name');
+    const { trip_id, ...body } = args;
+    out(await post(`/api/trips/${trip_id}/budget`, body));
+  },
+};
+
+commands['budget:update'] = {
+  desc: 'Update a budget item',
+  usage: '--trip_id <id> --expense_id <id> [--name] [--category] [--total_price] [--note]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, expense_id: { type: 'number', desc: 'Budget item ID' }, name: { type: 'string', desc: 'Expense name' }, category: { type: 'string', desc: 'Category' }, total_price: { type: 'number', desc: 'Total price' }, persons: { type: 'number', desc: 'Persons' }, days: { type: 'number', desc: 'Days' }, note: { type: 'string', desc: 'Notes' } },
+  required: ['trip_id', 'expense_id'],
+  async run(args) {
+    need(args, 'trip_id', 'expense_id');
+    const { trip_id, expense_id, ...body } = args;
+    out(await put(`/api/trips/${trip_id}/budget/${expense_id}`, body));
+  },
+};
+
+commands['budget:delete'] = {
+  desc: 'Delete a budget item',
+  usage: '--trip_id <id> --expense_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, expense_id: { type: 'number', desc: 'Budget item ID' } },
+  required: ['trip_id', 'expense_id'],
+  async run(args) {
+    need(args, 'trip_id', 'expense_id');
+    out(await del(`/api/trips/${args.trip_id}/budget/${args.expense_id}`));
+  },
+};
+
+commands['budget:summary'] = {
+  desc: 'Per-person budget summary showing totals and payment status',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await get(`/api/trips/${args.trip_id}/budget/summary/per-person`));
+  },
+};
+
+// Reservations
+
+commands.reservations = {
+  desc: 'List reservations for a trip (flights, hotels, restaurants, etc.)',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await get(`/api/trips/${args.trip_id}/reservations`));
+  },
+};
+
+commands['reservation:add'] = {
+  desc: 'Add a reservation (flight, hotel, restaurant, activity, transport, other)',
+  usage: '--trip_id <id> --title <name> [--type flight|hotel|restaurant|activity|transport|other] [--reservation_time] [--reservation_end_time] [--location] [--confirmation_number] [--notes] [--status] [--day_id] [--place_id]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, title: { type: 'string', desc: 'Reservation title' }, type: { type: 'string', desc: 'Type: flight, hotel, restaurant, activity, transport, other' }, reservation_time: { type: 'string', desc: 'Start time (ISO datetime)' }, reservation_end_time: { type: 'string', desc: 'End time (ISO datetime)' }, location: { type: 'string', desc: 'Location or address' }, confirmation_number: { type: 'string', desc: 'Booking confirmation number' }, notes: { type: 'string', desc: 'Additional notes' }, status: { type: 'string', desc: 'Status: pending, confirmed, cancelled' }, day_id: { type: 'number', desc: 'Link to a specific day' }, place_id: { type: 'number', desc: 'Link to a specific place' } },
+  required: ['trip_id', 'title'],
+  async run(args) {
+    need(args, 'trip_id', 'title');
+    const { trip_id, ...body } = args;
+    out(await post(`/api/trips/${trip_id}/reservations`, body));
+  },
+};
+
+commands['reservation:update'] = {
+  desc: 'Update a reservation',
+  usage: '--trip_id <id> --reservation_id <id> [--title] [--type] [--status] ...',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, reservation_id: { type: 'number', desc: 'Reservation ID' }, title: { type: 'string', desc: 'Title' }, type: { type: 'string', desc: 'Type' }, reservation_time: { type: 'string', desc: 'Start time' }, reservation_end_time: { type: 'string', desc: 'End time' }, location: { type: 'string', desc: 'Location' }, confirmation_number: { type: 'string', desc: 'Confirmation number' }, notes: { type: 'string', desc: 'Notes' }, status: { type: 'string', desc: 'Status' }, day_id: { type: 'number', desc: 'Day ID' }, place_id: { type: 'number', desc: 'Place ID' } },
+  required: ['trip_id', 'reservation_id'],
+  async run(args) {
+    need(args, 'trip_id', 'reservation_id');
+    const { trip_id, reservation_id, ...body } = args;
+    out(await put(`/api/trips/${trip_id}/reservations/${reservation_id}`, body));
+  },
+};
+
+commands['reservation:delete'] = {
+  desc: 'Delete a reservation',
+  usage: '--trip_id <id> --reservation_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, reservation_id: { type: 'number', desc: 'Reservation ID' } },
+  required: ['trip_id', 'reservation_id'],
+  async run(args) {
+    need(args, 'trip_id', 'reservation_id');
+    out(await del(`/api/trips/${args.trip_id}/reservations/${args.reservation_id}`));
+  },
+};
+
+// Packing
+
+commands.packing = {
+  desc: 'List packing items for a trip, grouped by category',
+  usage: '--trip_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' } },
+  required: ['trip_id'],
+  async run(args) {
+    need(args, 'trip_id');
+    out(await get(`/api/trips/${args.trip_id}/packing`));
+  },
+};
+
+commands['packing:add'] = {
+  desc: 'Add a packing item',
+  usage: '--trip_id <id> --name <name> [--category]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, name: { type: 'string', desc: 'Item name' }, category: { type: 'string', desc: 'Category (e.g. Clothing, Electronics, Toiletries)' } },
+  required: ['trip_id', 'name'],
+  async run(args) {
+    need(args, 'trip_id', 'name');
+    const { trip_id, ...body } = args;
+    out(await post(`/api/trips/${trip_id}/packing`, body));
+  },
+};
+
+commands['packing:check'] = {
+  desc: 'Toggle packed status of a packing item',
+  usage: '--trip_id <id> --item_id <id> --checked true|false',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, item_id: { type: 'number', desc: 'Packing item ID' }, checked: { type: 'boolean', desc: 'Whether the item is packed' } },
+  required: ['trip_id', 'item_id', 'checked'],
+  async run(args) {
+    need(args, 'trip_id', 'item_id');
+    out(await put(`/api/trips/${args.trip_id}/packing/${args.item_id}`, { checked: !!args.checked }));
+  },
+};
+
+commands['packing:delete'] = {
+  desc: 'Remove a packing item',
+  usage: '--trip_id <id> --item_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, item_id: { type: 'number', desc: 'Packing item ID' } },
+  required: ['trip_id', 'item_id'],
+  async run(args) {
+    need(args, 'trip_id', 'item_id');
+    out(await del(`/api/trips/${args.trip_id}/packing/${args.item_id}`));
+  },
+};
+
+// Maps & Weather
+
+commands.search = {
+  desc: 'Search for a location/place via Google Places or OpenStreetMap',
+  usage: '--query "restaurants near Shibuya Tokyo"',
+  args: { query: { type: 'string', desc: 'Search query' } },
+  required: ['query'],
+  async run(args) {
+    need(args, 'query');
+    out(await post('/api/maps/search', { query: args.query }));
+  },
+};
+
+commands['place:details'] = {
+  desc: 'Get detailed info about a map place (ratings, hours, reviews)',
+  usage: '--place_id <google_place_id or osm_id>',
+  args: { place_id: { type: 'string', desc: 'Google Place ID or OSM ID from search results' } },
+  required: ['place_id'],
+  async run(args) {
+    need(args, 'place_id');
+    out(await get(`/api/maps/details/${args.place_id}`));
+  },
+};
+
+commands.weather = {
+  desc: 'Get weather for a location. Current if no date, forecast up to 16 days, historical averages beyond.',
+  usage: '--lat <num> --lng <num> [--date YYYY-MM-DD]',
+  args: { lat: { type: 'number', desc: 'Latitude' }, lng: { type: 'number', desc: 'Longitude' }, date: { type: 'string', desc: 'Date (YYYY-MM-DD). Omit for current weather.' } },
+  required: ['lat', 'lng'],
+  async run(args) {
+    need(args, 'lat', 'lng');
+    const params = new URLSearchParams({ lat: args.lat, lng: args.lng, lang: 'en' });
+    if (args.date) params.set('date', args.date);
+    out(await get(`/api/weather?${params}`));
+  },
+};
+
+// Day Notes
+
+commands['notes'] = {
+  desc: 'List notes for a specific day',
+  usage: '--trip_id <id> --day_id <id>',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, day_id: { type: 'number', desc: 'Day ID' } },
+  required: ['trip_id', 'day_id'],
+  async run(args) {
+    need(args, 'trip_id', 'day_id');
+    out(await get(`/api/trips/${args.trip_id}/days/${args.day_id}/notes`));
+  },
+};
+
+commands['note:add'] = {
+  desc: 'Add a note to a specific day',
+  usage: '--trip_id <id> --day_id <id> --text <text> [--time "09:00"] [--icon]',
+  args: { trip_id: { type: 'number', desc: 'Trip ID' }, day_id: { type: 'number', desc: 'Day ID' }, text: { type: 'string', desc: 'Note text (max 500 chars)' }, time: { type: 'string', desc: 'Time label (e.g. "09:00")' }, icon: { type: 'string', desc: 'Emoji icon' } },
+  required: ['trip_id', 'day_id', 'text'],
+  async run(args) {
+    need(args, 'trip_id', 'day_id', 'text');
+    const { trip_id, day_id, ...body } = args;
+    out(await post(`/api/trips/${trip_id}/days/${day_id}/notes`, body));
+  },
+};
+
+// ── Help & Main ─────────────────────────────────────────────
+
+function showHelp(json) {
+  if (json) {
+    const schema = Object.fromEntries(
+      Object.entries(commands).map(([name, cmd]) => [name, {
+        description: cmd.desc,
+        args: cmd.args || {},
+        required: cmd.required || [],
+      }])
+    );
+    out(schema);
+    return;
+  }
+  console.log('trek — CLI for the TREK travel planner\n');
+  console.log('Usage: trek <command> [options]\n');
+  console.log('Commands:');
+  const maxLen = Math.max(...Object.keys(commands).map(k => k.length));
+  for (const [name, cmd] of Object.entries(commands)) {
+    console.log(`  ${name.padEnd(maxLen + 2)} ${cmd.desc}`);
+  }
+  console.log('\nRun `trek <command> --help` for command-specific usage.');
+  console.log('Run `trek help --json` for machine-readable command schemas.');
+  console.log('\nConfig via env vars or .env file:');
+  console.log('  TREK_URL       https://your-trek-instance.example.com');
+  console.log('  TREK_EMAIL     your login email');
+  console.log('  TREK_PASSWORD  your password');
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0 || argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
+    showHelp(argv.includes('--json'));
+    process.exit(0);
+  }
+
+  const cmdName = argv[0];
+  const cmd = commands[cmdName];
+  if (!cmd) die(`Unknown command: ${cmdName}. Run 'trek help' for available commands.`);
+
+  const { named } = parseArgs(argv.slice(1));
+  if (named.help) {
+    if (named.json) {
+      out({ command: cmdName, description: cmd.desc, args: cmd.args || {}, required: cmd.required || [] });
+    } else {
+      console.log(`trek ${cmdName} — ${cmd.desc}\n`);
+      console.log(`Usage: trek ${cmdName} ${cmd.usage}`);
+    }
+    process.exit(0);
+  }
+
+  await cmd.run(named);
+}
+
+main().catch(e => die(e.message));
